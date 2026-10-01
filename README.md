@@ -8,6 +8,7 @@
 - **并列裁决**：换轨次数相同时，取“按输入顺序排列的轨道号序列”字典序最小的方案。
 - 同一说话人的字幕时间不得重叠（属于输入合法性约束，非法返回 422）。
 - 分轨结果可作为**场景（scene）**按 `scene_id` 保存为版本化修订：新场景以 `expected_revision: 0` 创建（成功后版本 1），后续修订须带当前版本；版本不符返回 409。数据落在本地 SQLite，容器重启后仍可读取。
+- 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。
 
 ## 一条命令启动
 
@@ -278,6 +279,121 @@ HTTP/1.1 409 Conflict
 
 > 合法但无解的场景修订不产生 409/200 快照，而是与示例 3/4 的 `/assign` 一样返回 `{"feasible": false, "changes": 0, "assignments": []}`，且不落库、不推进版本。非法输入（缺少 `expected_revision`、`track_count` 越界、说话人字幕重叠等）返回 422，同样不改动已有版本。
 
+## 播放会话（session）：播放中接纳后续修订
+
+`/assign` 与 `/scenes` 都是无状态的计算/存储；播放会话则让“正在播放”的场景跟上后续修订：先按 `scene_id` 创建会话（复制场景当时的完整快照，游标从 0 毫秒开始），播放过程中推进游标，场景被修订后让会话接纳最新快照。会话是**单进程内存态**，不写入 SQLite、不跨重启保留；同一会话上的推进与接纳按完整操作串行生效（并发请求不会交错出中间态）。
+
+- `POST /sessions`：创建会话。请求体 `{"scene_id": "..."}`；场景不存在返回 404。响应为会话完整状态：`session_id`、`scene_id`、`source_revision`（快照来源的场景版本）、`cursor_ms`（初始 0）、`track_count`、`subtitles`、`assignments`、`changes`。
+- `POST /sessions/{session_id}/advance`：推进游标。请求体 `{"time_ms": N}`，`N` 为非负整数且**只能不减**（等于当前游标允许）；负数、非整数或倒退返回 422 且会话不变。响应含 `source_revision`、`cursor_ms` 与 `active`：游标时刻处于 `[start_ms, end_ms)`（左闭右开）区间的字幕及其轨道。
+- `POST /sessions/{session_id}/accept`：接纳场景当前快照。规则：
+  - 轨道数不得变；
+  - 会话中 `start_ms` ≤ 游标的字幕（已开始，含已播完），其 `id`、`speaker`、起止时间、`locked_track` 必须不变，并**固定原分轨**；
+  - 其余字幕可改、可删、可新增，但都必须在游标之后开始（`start_ms` > 游标）；
+  - 按新快照顺序与最少换轨、并列规则重算全部分轨。
+  - 冲突或无解返回 **409** 且会话不变；成功则整体替换会话快照与 `source_revision`（**场景本身不变**），返回会话最新完整状态。
+- 会话不存在（含服务重启后）返回 404。
+
+### 示例 10：创建会话并推进游标
+
+沿用示例 6 创建的场景 `scene-001`（revision 1）：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id": "scene-001"}'
+```
+
+```json
+{
+  "session_id": "9f2c…（略）",
+  "scene_id": "scene-001",
+  "source_revision": 1,
+  "cursor_ms": 0,
+  "track_count": 2,
+  "changes": 0,
+  "subtitles": [ … ],
+  "assignments": [
+    {"id": "s1", "track": 1},
+    {"id": "s2", "track": 2},
+    {"id": "s3", "track": 1}
+  ]
+}
+```
+
+推进到 900 毫秒（`$SID` 为上一步返回的 `session_id`）：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' \
+  -d '{"time_ms": 900}'
+```
+
+```json
+{
+  "session_id": "9f2c…",
+  "scene_id": "scene-001",
+  "source_revision": 1,
+  "cursor_ms": 900,
+  "active": [
+    {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 1000, "locked_track": null, "track": 1},
+    {"id": "s2", "speaker": "Bob", "start_ms": 800, "end_ms": 3000, "locked_track": 2, "track": 2}
+  ]
+}
+```
+
+`active` 为游标时刻 `[start_ms, end_ms)` 内的字幕及轨道：900 时 s1（0≤900<1000）与 s2（800≤900<3000）在屏，s3（1000 才开始）不在。再次提交更小的 `time_ms` 返回 422。
+
+### 示例 11：播放中接纳场景修订
+
+播放期间场景被修订（例如按示例 7 的方式把 `scene-001` 推进到 revision 2：s3 延长到 4000，并新增 s4 `[3200, 4000)`）。会话接纳最新快照：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/accept
+```
+
+```json
+{
+  "session_id": "9f2c…",
+  "scene_id": "scene-001",
+  "source_revision": 2,
+  "cursor_ms": 900,
+  "track_count": 2,
+  "changes": 0,
+  "subtitles": [ … s1, s2, s3(1000–4000), s4(3200–4000) ],
+  "assignments": [
+    {"id": "s1", "track": 1},
+    {"id": "s2", "track": 2},
+    {"id": "s3", "track": 1},
+    {"id": "s4", "track": 2}
+  ]
+}
+```
+
+游标 900 时 s1、s2 已开始，保持原分轨 1、2 不变；s3、s4 在游标之后开始，按新快照重算分轨。`source_revision` 变为 2，场景本身的版本与内容不受接纳影响。
+
+### 示例 12：接纳冲突返回 409（会话不变）
+
+若场景的修订动了已开始字幕（上例中游标 900 时修改了 s1 的起止时间、删除 s2、把轨道数改为 3，或新增的字幕在 900 之前开始等），接纳失败：
+
+```bash
+curl -s -i -X POST http://localhost:8080/sessions/$SID/accept
+```
+
+```
+HTTP/1.1 409 Conflict
+```
+
+```json
+{
+  "detail": {
+    "message": "字幕 's1' 已开始，其 id/speaker/起止时间/locked_track 不得修改",
+    "scene_id": "scene-001"
+  }
+}
+```
+
+固定已开始字幕的原分轨后新快照无解时同样返回 409。失败的接纳不改变会话：游标、快照、`source_revision` 保持原值，可继续推进或在场景改回合法内容后重试接纳。
+
 健康检查：
 
 ```bash
@@ -322,11 +438,13 @@ app/
   main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验）
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
   storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制）
+  playback.py  # 播放会话：单进程内存态，推进/接纳与保轨重算
 tests/
-  conftest.py        # pytest 夹具（场景接口使用临时数据库）
+  conftest.py        # pytest 夹具（场景接口使用临时数据库、会话隔离）
   test_solver.py     # 求解器单元测试
   test_api.py        # /assign HTTP 层测试
   test_scenes.py     # 场景创建/修订/读取/版本冲突/并发测试
+  test_playback.py   # 播放会话创建/推进/接纳/冲突/并发测试
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data
 requirements.txt / requirements-dev.txt

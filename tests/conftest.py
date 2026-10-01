@@ -19,5 +19,7 @@ def _isolated_scene_db(tmp_path, monkeypatch):
 
     monkeypatch.setattr(storage_module, "DEFAULT_DB_PATH", db_path)
     main_module.reset_store()
+    main_module.reset_playback()
     yield
     main_module.reset_store()
+    main_module.reset_playback()
