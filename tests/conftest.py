@@ -19,5 +19,8 @@ def _isolated_scene_db(tmp_path, monkeypatch):
 
     monkeypatch.setattr(storage_module, "DEFAULT_DB_PATH", db_path)
     main_module.reset_store()
+    # 播放会话是单进程内存态：每个测试开始前清空，避免相互串扰
+    main_module.playback.reset()
     yield
     main_module.reset_store()
+    main_module.playback.reset()

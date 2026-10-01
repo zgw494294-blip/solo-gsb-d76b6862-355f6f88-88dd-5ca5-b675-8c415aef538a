@@ -8,6 +8,21 @@
 - **并列裁决**：换轨次数相同时，取“按输入顺序排列的轨道号序列”字典序最小的方案。
 - 同一说话人的字幕时间不得重叠（属于输入合法性约束，非法返回 422）。
 - 分轨结果可作为**场景（scene）**按 `scene_id` 保存为版本化修订：新场景以 `expected_revision: 0` 创建（成功后版本 1），后续修订须带当前版本；版本不符返回 409。数据落在本地 SQLite，容器重启后仍可读取。
+- 已保存场景可按 `scene_id` 建立**单进程内存播放会话**：复制完整快照、游标从 0 毫秒开始，推进只能不减；播放中可**接纳**场景后续修订——已开始字幕的身份与分轨固定，其余字幕重算，冲突或无解返回 409。会话不跨重启保留。
+
+## 接口一览
+
+| 方法 | 地址 | 说明 |
+| --- | --- | --- |
+| POST | `http://localhost:8080/assign` | 一次性分轨计算，不保存 |
+| PUT | `http://localhost:8080/scenes/{scene_id}` | 创建/修订场景（乐观锁版本控制） |
+| GET | `http://localhost:8080/scenes/{scene_id}` | 读取场景最近快照 |
+| POST | `http://localhost:8080/scenes/{scene_id}/session` | 创建（或重置）内存播放会话 |
+| POST | `http://localhost:8080/scenes/{scene_id}/session/advance` | 推进游标（非负、不减） |
+| POST | `http://localhost:8080/scenes/{scene_id}/session/adopt` | 接纳场景当前快照 |
+| GET | `http://localhost:8080/scenes/{scene_id}/session` | 查看会话完整状态 |
+| GET | `http://localhost:8080/health` | 健康检查 |
+| GET | `http://localhost:8080/docs` | Swagger 交互文档 |
 
 ## 一条命令启动
 
@@ -21,6 +36,7 @@ docker compose up --build -d
 
 > - 交互式查看日志可去掉 `-d`。交互式文档：`http://localhost:8080/docs`（Swagger UI）。
 > - Compose 自动把具名卷 `scenes-data` 挂载到容器内 `/data`：场景数据库（`SCENES_DB_PATH=/data/scenes.db`）在容器重启甚至 `docker compose down && up` 后仍然保留。仅 `docker compose down -v` 删除卷时才会清除场景。
+> - 播放会话是**单进程内存态**：Compose/Dockerfile 默认只启动一个 uvicorn 进程，推进与接纳在进程内串行生效；多进程（多 worker/多机）部署不共享会话，需要时请自行保证单实例。
 
 ## 请求
 
@@ -278,6 +294,142 @@ HTTP/1.1 409 Conflict
 
 > 合法但无解的场景修订不产生 409/200 快照，而是与示例 3/4 的 `/assign` 一样返回 `{"feasible": false, "changes": 0, "assignments": []}`，且不落库、不推进版本。非法输入（缺少 `expected_revision`、`track_count` 越界、说话人字幕重叠等）返回 422，同样不改动已有版本。
 
+## 播放会话（playback session）：播放中接纳后续修订
+
+场景开始播放后，客户端可能继续提交修订。播放会话让“正在播放的快照”在接纳新修订时**保持已开始字幕的轨道不动**，只对游标之后的内容重新分轨。
+
+- 会话是**单进程内存态**：按 `scene_id` 建立，复制已保存场景的**完整快照**（字幕、分轨、changes、版本），播放游标 `cursor_ms` 从 **0** 开始。
+- 会话**无需跨重启保留**：服务进程重启后会话消失（已保存的场景不受影响），重新建会即可。一个 `scene_id` 同时只有一个会话，重复建会即按场景最新快照整体重置（游标归零）。
+- 接口地址（均基于场景地址）：
+  - `POST http://localhost:8080/scenes/{scene_id}/session`：建会（或重置）；
+  - `POST http://localhost:8080/scenes/{scene_id}/session/advance`：推进游标；
+  - `POST http://localhost:8080/scenes/{scene_id}/session/adopt`：接纳场景当前快照；
+  - `GET  http://localhost:8080/scenes/{scene_id}/session`：查看会话完整状态。
+
+### 推进：`POST .../session/advance`
+
+请求体 `{"time_ms": <非负整数>}`：游标**只能不减**（相等允许，即原地停留）。
+
+- 非法时间（负数、非整数、缺字段）或倒退：**422**，失败不改动会话。
+- 成功返回源版本 `source_revision`、`cursor_ms`、游标处**活动字幕** `active` 与按轨道分组的 `tracks`。
+- 活动字幕仍按**左闭右开** `[start_ms, end_ms)` 判定：`start_ms <= cursor_ms < end_ms`，端点相接不算重叠。
+
+### 接纳：`POST .../session/adopt`（无请求体）
+
+以该 `scene_id` **当前已保存**的场景快照替换会话快照，规则：
+
+1. **轨道数不得改变**（与建会时一致），否则 409；
+2. 会话中 `start_ms <= cursor_ms` 的字幕（已开始，含已经播完的）视为既成事实：其 `id`、`speaker`、`start_ms`、`end_ms`、`locked_track` **必须逐字不变**，并且**固定会话中的原分轨**，不得删除；
+3. 其余字幕允许修改、删除或新增，但它们在新快照中的 `start_ms` 都必须**严格晚于游标**；
+4. 以**新快照的顺序**，沿用原“最少换轨、轨道序列字典序最小”的并列规则，把已开始字幕的固定轨道作为锁定约束，对**全部**字幕重新求解分轨；
+5. 接纳冲突（规则 1～3 任一不满足）或重算**无解**：返回 **409**（`detail.reason` 给出原因），**会话保持原样**；
+6. 接纳成功：**整体替换**会话快照与 `source_revision`，游标不变，`changes`/`assignments` 为重算结果；**已保存的场景本身不被修改**。
+
+推进与接纳的并发请求在服务端按**完整操作串行生效**，因此读到的永远是某个完整操作之后的自洽状态。
+
+### 示例 10：建会并推进（游标左闭右开）
+
+```bash
+# 先用示例 6 的场景 scene-001（revision=1；s1=[0,1000) 轨1，s2=[800,3000) 轨2，s3=[1000,2500) 轨1）
+curl -s -X POST http://localhost:8080/scenes/scene-001/session
+curl -s -X POST http://localhost:8080/scenes/scene-001/session/advance \
+  -H 'Content-Type: application/json' \
+  -d '{"time_ms": 800}'
+```
+
+推进到 800ms 的响应：
+
+```json
+{
+  "scene_id": "scene-001",
+  "source_revision": 1,
+  "cursor_ms": 800,
+  "active": [
+    {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000, "locked_track": null, "track": 1},
+    {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2,    "track": 2}
+  ],
+  "tracks": [
+    {"track": 1, "occupied": [{"id": "s1", "speaker": "Alice", "start_ms": 0,   "end_ms": 1000, "locked_track": null, "track": 1}]},
+    {"track": 2, "occupied": [{"id": "s2", "speaker": "Bob",   "start_ms": 800, "end_ms": 3000, "locked_track": 2,    "track": 2}]}
+  ]
+}
+```
+
+游标推进到 `1000` 时，s1 因右端点开区间而结束、s3 端点相接开始：
+
+```bash
+curl -s -X POST http://localhost:8080/scenes/scene-001/session/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1000}'
+# active 变为 s2、s3
+```
+
+倒退返回 422 且会话不变：
+
+```bash
+curl -s -i -X POST http://localhost:8080/scenes/scene-001/session/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 999}'
+# HTTP/1.1 422 Unprocessable Entity
+# detail 中含当前 cursor_ms=1000 与被拒绝的 time_ms=999
+```
+
+### 示例 11：播放中修订场景并接纳（已开始字幕固定原轨）
+
+播放停在 800ms 时（s1、s2 已开始），照常通过 `PUT /scenes/scene-001` 提交 revision 2：已开始字幕原样保留，只改游标之后的内容（例如缩短 s3、新增 s5）：
+
+```bash
+curl -s -X PUT http://localhost:8080/scenes/scene-001 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 1,
+    "subtitles": [
+      {"id": "s1", "speaker": "Alice", "start_ms": 0,   "end_ms": 1000},
+      {"id": "s2", "speaker": "Bob",   "start_ms": 800, "end_ms": 3000, "locked_track": 2},
+      {"id": "s3", "speaker": "Alice", "start_ms": 1000,"end_ms": 2000},
+      {"id": "s5", "speaker": "Carol", "start_ms": 2000,"end_ms": 2600}
+    ]
+  }'
+
+curl -s -X POST http://localhost:8080/scenes/scene-001/session/adopt
+```
+
+接纳响应（HTTP 200）中 `source_revision` 变为 `2`、`cursor_ms` 仍为 `800`；`assignments` 为全量重算结果，其中 s1、s2 固定在轨道 1、2，s3、s5 按最少换轨/字典序规则重新分轨。之后继续推进即按新快照播放：
+
+```bash
+curl -s -X POST http://localhost:8080/scenes/scene-001/session/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1500}'
+# active: s2(轨2)、s3（重算后的轨道）
+```
+
+### 示例 12：接纳冲突返回 409（会话与场景都不变）
+
+已开始字幕被修改/删除、轨道数改变、或新字幕在游标处及之前开始，都会被拒绝。例如游标在 800ms，却把已开始的 s1 改短：
+
+```bash
+curl -s -i -X POST http://localhost:8080/scenes/scene-001/session/adopt
+```
+
+（假设当前保存的 revision 2 中 s1 的 `end_ms` 已被改动）
+
+```
+HTTP/1.1 409 Conflict
+```
+
+```json
+{
+  "detail": {
+    "message": "接纳修订失败：已开始字幕 's1' 的 end_ms 不得在播放中修改",
+    "scene_id": "scene-001",
+    "reason": "started_subtitle_changed",
+    "subtitle_id": "s1"
+  }
+}
+```
+
+此时 `GET /scenes/scene-001/session` 看到的仍是接纳前的快照（`source_revision` 不变、游标不变）。其他 `reason` 取值：`track_count_changed`、`started_subtitle_missing`、`subtitle_starts_before_cursor`、`duplicate_id`、`infeasible`（固定已开始字幕后重算无解）。
+
+> 接纳读取的是场景**已保存**的最新版本；合法但无解的修订根本不会落库（见示例 3/4 的无解响应），因此不会被接纳。接纳操作只改会话，不推进场景版本；场景仍需通过 `PUT /scenes/{scene_id}` 修订。
+
 健康检查：
 
 ```bash
@@ -322,11 +474,13 @@ app/
   main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验）
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
   storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制）
+  playback.py  # 单进程内存播放会话：游标推进、接纳修订（固定已开始字幕重算）
 tests/
-  conftest.py        # pytest 夹具（场景接口使用临时数据库）
+  conftest.py        # pytest 夹具（场景接口使用临时数据库、会话逐测试清空）
   test_solver.py     # 求解器单元测试
   test_api.py        # /assign HTTP 层测试
   test_scenes.py     # 场景创建/修订/读取/版本冲突/并发测试
+  test_sessions.py   # 播放会话建会/推进/接纳/冲突/并发测试
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data
 requirements.txt / requirements-dev.txt
